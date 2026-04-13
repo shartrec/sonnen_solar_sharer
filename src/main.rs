@@ -2,16 +2,17 @@ mod config;
 mod schedule;
 
 use crate::config::Config;
-use crate::schedule::{cleanup, manage_battery};
-use chrono::{Local, NaiveTime};
+use crate::schedule::{cleanup, manage_battery, SonnenClient};
+use chrono::{Local, NaiveTime, TimeDelta};
 use log::{info, warn, LevelFilter};
 use signal_hook::consts::signal::*;
 use signal_hook::iterator::Signals;
 use std::fs;
+use std::ops::Add;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::Duration;
 use clap::Parser;
 use directories::ProjectDirs;
 use systemd_journal_logger::JournalLog;
@@ -25,7 +26,7 @@ struct Args {
 
     /// Run once and exit (useful for testing)
     #[arg(short, long)]
-    once: bool,
+    dry_run: bool,
 }
 
 fn main() {
@@ -48,37 +49,30 @@ fn main() {
 
     info!("Using config: {:?}", config_path);
 
-    let config_content = fs::read_to_string("config.toml").expect("Could not read config.toml");
+    let config_content = fs::read_to_string(&config_path).expect("Could not read config file");
     let config: Config = toml::from_str(&config_content).expect("Invalid TOML format");
 
-    // Set up signal handling for graceful shutdown
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shutdown_flag_clone = shutdown_flag.clone();
+    let client = SonnenClient {
+        ip: config.battery.ip.clone(),
+        token: config.battery.token.clone(),
+        dry_run: args.dry_run,
+    };
 
+    // have a graceful shutdown mechanism using channels to signal the main loop to exit
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut signals =
-            Signals::new(&[SIGTERM, SIGINT]).expect("Failed to register signal handlers");
-
-        for sig in signals.forever() {
-            match sig {
-                SIGTERM | SIGINT => {
-                    info!("Received shutdown signal. Cleaning up...");
-                    shutdown_flag_clone.store(true, Ordering::SeqCst);
-                    break;
-                }
-                _ => unreachable!(),
-            }
+        let mut signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
+        if let Some(sig) = signals.forever().next() {
+            info!("Received signal: {}. Cleaning up...", sig);
+            // We don't have easy access to config/client here unless we wrap in Arc
+            // or just let the main thread handle cleanup after the break.
+            let _ = tx.send(());
         }
     });
 
     loop {
-        // Check if shutdown signal was received
-        if shutdown_flag.load(Ordering::SeqCst) {
-            cleanup(&config);
-            break;
-        }
 
-        if let Err(e) = manage_battery(&config) {
+        if let Err(e) = manage_battery(&config, &client) {
             warn!("Error managing battery: {}", e);
         }
 
@@ -89,7 +83,7 @@ fn main() {
             .schedule
             .start_time
             .parse::<NaiveTime>()
-            .expect("Invalid stop_time format in config");
+            .expect("Invalid start_time format in config");
         let free_end = config
             .schedule
             .stop_time
@@ -97,23 +91,39 @@ fn main() {
             .expect("Invalid stop_time format in config");
 
         let now = Local::now().time();
-        if now > free_start && now < free_end {
+        let sleep_duration_sec = if now > free_start && now < free_end {
             info!("Currently in free window. Will check every minute to ensure schedule is set.");
+            Duration::from_secs(60)
         } else {
             let next_action_time = if now < free_start {
                 free_start
             } else {
-                free_end
+                free_start // Next day's free start? Actually, for simplicity, let's just wait a bit if we're past end
             };
-            let duration_until_next_action = next_action_time.signed_duration_since(now);
+            
+            // Re-calculate sleep logic for better robustness
+            let mut duration_until_next_action = next_action_time.signed_duration_since(now);
+            if duration_until_next_action.num_seconds() <= 0 {
+                // If we're past today's start, it might be for tomorrow.
+                // We'll wait 5 mins
+                duration_until_next_action = TimeDelta::minutes(5);
+            }
+
             info!(
-                "Next action at {}. Sleeping for {} seconds.",
+                "Next action at {}. Sleeping for {} seconds, until {}",
                 next_action_time,
-                duration_until_next_action.num_seconds()
+                duration_until_next_action.num_seconds(),
+                now.add(duration_until_next_action)
             );
-            std::thread::sleep(std::time::Duration::from_secs(
-                duration_until_next_action.num_seconds() as u64,
-            ));
+            Duration::from_secs(duration_until_next_action.num_seconds() as u64)
+        };
+        // 3. The "Interruptible Sleep"
+        // If rx receives a message, it returns Ok(()) immediately.
+        // If the duration passes first, it returns Err(Timeout).
+        if let Ok(_) = rx.recv_timeout(sleep_duration_sec) {
+            info!("Graceful shutdown triggered.");
+            cleanup(&config, &client);
+            break;
         }
     }
 }
