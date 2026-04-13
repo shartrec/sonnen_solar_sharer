@@ -1,0 +1,9 @@
+[battery]
+ip = "192.168.1.100"
+token = "secret-token"
+max_charge_watt = 5000
+
+[schedule]
+start_time = "15:00"
+stop_time = "16:30"
+            
