@@ -1,0 +1,16 @@
+[package]
+name = "sonnen_solar_sharer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ureq = { version = "3.3", features = ["json"] }
+serde = { version = "1.0", features = ["derive"]}
+log = "0.4"
+systemd-journal-logger = "2.2"
+simple_logger = { version = "5.0", features = ["stderr"] }
+chrono = "0.4"
+toml = "1.1.2"
+signal-hook = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+directories = "5.0"
