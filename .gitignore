@@ -1,1 +1,6 @@
 /target
+/.idea/.gitignore
+/.idea/copilot.data.migration.ask2agent.xml
+/.idea/modules.xml
+/.idea/sonnen_solar_sharer.iml
+/.idea/vcs.xml
